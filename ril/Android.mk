@@ -14,14 +14,5 @@
 # limitations under the License.
 #
 
-RIL_PATH := $(call my-dir)
-
-ifeq ($(BOARD_VENDOR),samsung)
-
-
-# ril client
-SECRIL_CLIENT_DIRS := libsecril-client libsecril-client-sap
-include $(foreach client_dirs,$(SECRIL_CLIENT_DIRS),$(RIL_PATH)/$(client_dirs)/Android.mk)
-
-endif
-
+# Samsung RIL modules are defined in Android.bp.  Keep this file as an empty
+# compatibility stub for products that still scan hardware Android.mk files.

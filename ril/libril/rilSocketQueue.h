@@ -14,7 +14,11 @@
 * limitations under the License.
 */
 
+#ifndef RIL_SOCKET_QUEUE_H_INCLUDED
+#define RIL_SOCKET_QUEUE_H_INCLUDED
+
 #include "pb_decode.h"
+#include <stdlib.h>
 #include <pthread.h>
 #include <hardware/ril/librilutils/proto/sap-api.pb.h>
 #include <utils/Log.h>
@@ -163,3 +167,5 @@ int Ril_queue<T>::empty(void) {
         return 0;
     }
 }
+
+#endif  // RIL_SOCKET_QUEUE_H_INCLUDED

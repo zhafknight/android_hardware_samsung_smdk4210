@@ -14,8 +14,10 @@
 * limitations under the License.
 */
 
+#define __STDC_LIMIT_MACROS
 #include <stdint.h>
 #define RIL_SHLIB
+#include "telephony/ril.h"
 #include "RilSapSocket.h"
 #include "pb_decode.h"
 #include "pb_encode.h"
@@ -24,8 +26,7 @@
 #include <utils/Log.h>
 #include <arpa/inet.h>
 #include <errno.h>
-#include "sap_service.h"
-#include "ril.h"
+#include <sap_service.h>
 
 static RilSapSocket::RilSapSocketList *head = NULL;
 

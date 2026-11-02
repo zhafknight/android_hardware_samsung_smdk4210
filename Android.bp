@@ -1,5 +1,7 @@
 subdirs = [
     "ril/libril",
+    "ril/libsecril-client",
+    "ril/libsecril-client-sap",
     "exynos4",
     "audio_service",
 ]

@@ -17,7 +17,7 @@
 #ifndef RIL_UIM_SOCKET_H_INCLUDED
 #define RIL_UIM_SOCKET_H_INCLUDED
 #define RIL_SHLIB
-#include "ril.h"
+#include "telephony/ril.h"
 #include "RilSocket.h"
 #include <hardware/ril/librilutils/proto/sap-api.pb.h>
 
@@ -37,7 +37,7 @@
 class RilSapSocket : public RilSocket {
     /**
      * Place holder for the radio functions returned by the initialization
-     * function. Currently only onRequest handler is being used.
+     * function. Currenty only onRequest handler is being used.
      */
     const RIL_RadioFunctions* uimFuncs;
 

@@ -1,4 +1,4 @@
-/* //guest/hals/ril/ril.cpp
+/* //device/libs/telephony/ril.cpp
 **
 ** Copyright 2006, The Android Open Source Project
 **
@@ -18,10 +18,10 @@
 #define LOG_TAG "RILC"
 
 #include <hardware_legacy/power.h>
-#include <hwbinder/ProcessState.h>
-#include "ril.h"
+#include <telephony/ril.h>
 #include <telephony/ril_cdma_sms.h>
 #include <cutils/sockets.h>
+#include <hwbinder/ProcessState.h>
 #include <telephony/record_stream.h>
 #include <utils/Log.h>
 #include <utils/SystemClock.h>
@@ -44,15 +44,19 @@
 #include <assert.h>
 #include <netinet/in.h>
 #include <cutils/properties.h>
-#include "RilSapSocket.h"
-#include "ril_service.h"
-#include "sap_service.h"
+#include <RilSapSocket.h>
+#include <ril_service.h>
+#include <sap_service.h>
 
 extern "C" void
 RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responselen);
 
 extern "C" void
 RIL_onRequestAck(RIL_Token t);
+
+extern "C" void
+initWithMmapSize();
+
 namespace android {
 
 #define PHONE_PROCESS "radio"
@@ -64,7 +68,6 @@ namespace android {
 #define ANDROID_WAKE_LOCK_USECS 200000
 
 #define PROPERTY_RIL_IMPL "gsm.version.ril-impl"
-#define HW_BINDER_MMAP_SIZE 524288
 
 // match with constant in RIL.java
 #define MAX_COMMAND_BYTES (8 * 1024)
@@ -82,6 +85,9 @@ namespace android {
 
 // request, response, and unsolicited msg print macro
 #define PRINTBUF_SIZE 8096
+
+// Set hwbinder buffer size to 512KB
+#define HW_BINDER_MMAP_SIZE 524288
 
 enum WakeType {DONT_WAKE, WAKE_PARTIAL};
 
@@ -184,22 +190,20 @@ static UserCallbackInfo * internalRequestTimedCallback
 
 /** Index == requestNumber */
 static CommandInfo s_commands[] = {
-#include "./ril_commands.h"
+#include "ril_commands.h"
 };
 
 static UnsolResponseInfo s_unsolResponses[] = {
-#include "./ril_unsol_commands.h"
+#include "ril_unsol_commands.h"
 };
 
-/* Radio Config Request @{ */
-static CommandInfo s_configCommands[] = {
-#include "./ril_config_commands.h"
+static CommandInfo s_commands_v[] = {
+#include <telephony/ril_commands_vendor.h>
 };
 
-static UnsolResponseInfo s_configUnsolResponses[] = {
-#include "./ril_config_unsol_commands.h"
+static UnsolResponseInfo s_unsolResponses_v[] = {
+#include <telephony/ril_unsol_commands_vendor.h>
 };
-/* }@ */
 
 char * RIL_getServiceName() {
     return ril_service_name;
@@ -207,7 +211,7 @@ char * RIL_getServiceName() {
 
 RequestInfo *
 addRequestToList(int serial, int slotId, int request) {
-    RequestInfo *pRI = nullptr;
+    RequestInfo *pRI;
     int ret;
     RIL_SOCKET_ID socket_id = (RIL_SOCKET_ID) slotId;
     /* Hook for current context */
@@ -235,6 +239,23 @@ addRequestToList(int serial, int slotId, int request) {
 #endif
 #endif
 
+    CommandInfo *pCI = NULL;
+    if (request >= RIL_OEM_REQUEST_BASE) {
+        int index = request - RIL_OEM_REQUEST_BASE;
+        RLOGD("processCommandBuffer: samsung request=%d, index=%d",
+                request, index);
+        if (index >= 0 && index < (int32_t)NUM_ELEMS(s_commands_v))
+            pCI = &(s_commands_v[index]);
+    } else {
+        if (request >= 0 && request < (int32_t)NUM_ELEMS(s_commands))
+            pCI = &(s_commands[request]);
+    }
+
+    if (pCI == NULL) {
+        RLOGE("No command descriptor for request %d", request);
+        return NULL;
+    }
+
     pRI = (RequestInfo *)calloc(1, sizeof(RequestInfo));
     if (pRI == NULL) {
         RLOGE("Memory allocation failed for request %s", requestToString(request));
@@ -242,14 +263,7 @@ addRequestToList(int serial, int slotId, int request) {
     }
 
     pRI->token = serial;
-    pRI->pCI = &(s_commands[request]);
-
-    if (request >= RIL_REQUEST_RADIO_CONFIG_BASE &&
-        request <= RIL_REQUEST_RADIO_CONFIG_LAST) {
-        request = request - RIL_REQUEST_RADIO_CONFIG_BASE;
-        pRI->pCI = &(s_configCommands[request]);
-    }
-
+    pRI->pCI = pCI;
     pRI->socket_id = socket_id;
 
     ret = pthread_mutex_lock(pendingRequestsMutexHook);
@@ -304,12 +318,12 @@ static void resendLastNITZTimeData(RIL_SOCKET_ID socket_id) {
                            : RESPONSE_UNSOLICITED;
         // acquire read lock for the service before calling nitzTimeReceivedInd() since it reads
         // nitzTimeReceived in ril_service
-        pthread_rwlock_t *radioServiceRwlockPtr = radio_1_6::getRadioServiceRwlock(
+        pthread_rwlock_t *radioServiceRwlockPtr = radio::getRadioServiceRwlock(
                 (int) socket_id);
         int rwlockRet = pthread_rwlock_rdlock(radioServiceRwlockPtr);
         assert(rwlockRet == 0);
 
-        int ret = radio_1_6::nitzTimeReceivedInd(
+        int ret = radio::nitzTimeReceivedInd(
             (int)socket_id, responseType, 0,
             RIL_E_SUCCESS, s_lastNITZTimeData, s_lastNITZTimeDataSize);
         if (ret == 0) {
@@ -451,7 +465,7 @@ RIL_register (const RIL_RadioFunctions *callbacks) {
         return;
     }
 
-    RLOGD("RIL_register: Samsung legacy RIL version %d", callbacks->version);
+    RLOGE("RIL_register: RIL version %d", callbacks->version);
 
     if (s_registerCalled > 0) {
         RLOGE("RIL_register has been called more than once. "
@@ -470,30 +484,24 @@ RIL_register (const RIL_RadioFunctions *callbacks) {
         assert(i == s_commands[i].requestNumber);
     }
 
+    for (int i = 0; i < (int)NUM_ELEMS(s_commands_v); i++) {
+        assert(i + RIL_OEM_REQUEST_BASE == s_commands_v[i].requestNumber);
+    }
+
     for (int i = 0; i < (int)NUM_ELEMS(s_unsolResponses); i++) {
         assert(i + RIL_UNSOL_RESPONSE_BASE
                 == s_unsolResponses[i].requestNumber);
     }
 
-    radio_1_6::registerService(&s_callbacks, s_commands);
+    for (int i = 0; i < (int)NUM_ELEMS(s_unsolResponses_v); i++) {
+        assert(i + SAMSUNG_UNSOL_RESPONSE_BASE
+                == s_unsolResponses_v[i].requestNumber
+                || s_unsolResponses_v[i].requestNumber >= 20000);
+    }
+
+    radio::registerService(&s_callbacks, s_commands);
     RLOGI("RILHIDL called registerService");
 
-    /* Radio Config Request @{ */
-    for (int i = 1; i < (int)NUM_ELEMS(s_configCommands); i++) {
-        assert(i == s_configCommands[i].requestNumber -
-            RIL_REQUEST_RADIO_CONFIG_BASE);
-    }
-
-    for (int i = 0; i < (int)NUM_ELEMS(s_configUnsolResponses); i++) {
-        assert(i == s_configUnsolResponses[i].requestNumber -
-            RIL_UNSOL_RESPONSE_RADIO_CONFIG_BASE);
-    }
-    radio_1_6::registerConfigService(&s_callbacks, s_configCommands);
-    /* }@ */
-
-    // SAP is registered later by RIL_register_socket() with callbacks returned
-    // by the vendor RIL_SAP_Init entry point. Registering it here would publish
-    // the same ISap/slot1 instance twice on Samsung's legacy rild flow.
 }
 
 extern "C" void
@@ -609,12 +617,12 @@ RIL_onRequestAck(RIL_Token t) {
     appendPrintBuf("Ack [%04d]< %s", pRI->token, requestToString(pRI->pCI->requestNumber));
 
     if (pRI->cancelled == 0) {
-        pthread_rwlock_t *radioServiceRwlockPtr = radio_1_6::getRadioServiceRwlock(
+        pthread_rwlock_t *radioServiceRwlockPtr = radio::getRadioServiceRwlock(
                 (int) socket_id);
         int rwlockRet = pthread_rwlock_rdlock(radioServiceRwlockPtr);
         assert(rwlockRet == 0);
 
-        radio_1_6::acknowledgeRequest((int) socket_id, pRI->token);
+        radio::acknowledgeRequest((int) socket_id, pRI->token);
 
         rwlockRet = pthread_rwlock_unlock(radioServiceRwlockPtr);
         assert(rwlockRet == 0);
@@ -622,7 +630,7 @@ RIL_onRequestAck(RIL_Token t) {
 }
 extern "C" void
 RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responselen) {
-    RequestInfo* pRI;
+    RequestInfo *pRI;
     int ret;
     RIL_SOCKET_ID socket_id = RIL_SOCKET_1;
 
@@ -634,7 +642,6 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
     }
 
     socket_id = pRI->socket_id;
-
 #if VDBG
     RLOGD("RequestComplete, %s", rilSocketIdToString(socket_id));
 #endif
@@ -667,16 +674,16 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
         RLOGE ("Calling responseFunction() for token %d", pRI->token);
 #endif
 
-        pthread_rwlock_t *radioServiceRwlockPtr = radio_1_6::getRadioServiceRwlock((int) socket_id);
+        pthread_rwlock_t *radioServiceRwlockPtr = radio::getRadioServiceRwlock((int) socket_id);
         int rwlockRet = pthread_rwlock_rdlock(radioServiceRwlockPtr);
         assert(rwlockRet == 0);
 
-        if (pRI->pCI->responseFunction != nullptr) {
+        if (pRI->pCI->responseFunction) {
+            RLOGE ("%s: ====> token %d response: (%p) responselen: %d", __func__, pRI->token, response, responselen);
             ret = pRI->pCI->responseFunction((int) socket_id,
                     responseType, pRI->token, e, response, responselen);
         } else {
-            RLOGW("No response function for request %d token %d",
-                  pRI->pCI->requestNumber, pRI->token);
+            RLOGE ("No unsolicited response function defined for token %d", pRI->token);
         }
 
         rwlockRet = pthread_rwlock_unlock(radioServiceRwlockPtr);
@@ -772,7 +779,8 @@ void RIL_onUnsolicitedResponse(int unsolResponse, const void *data,
     int ret;
     bool shouldScheduleTimeout = false;
     RIL_SOCKET_ID soc_id = RIL_SOCKET_1;
-    UnsolResponseInfo *pURI = NULL;
+    UnsolResponseInfo *pRI = NULL;
+    int32_t pRI_elements;
 
 #if defined(ANDROID_MULTI_SIM)
     soc_id = socket_id;
@@ -785,41 +793,50 @@ void RIL_onUnsolicitedResponse(int unsolResponse, const void *data,
         return;
     }
 
-#ifdef SAMSUNG_LEGACY_RIL
-    // Samsung's proprietary RIL emits private unsolicited codes in the 11000 and 20000 ranges.
-    // Android's public radio interface has no matching callback; ignore them instead of indexing
-    // the AOSP unsolicited-response table with a vendor offset.
-    if ((unsolResponse >= 11000 && unsolResponse < 12000) ||
-            (unsolResponse >= 20000 && unsolResponse < 21000)) {
-        RLOGD("Ignoring Samsung private unsolicited response %d", unsolResponse);
-        return;
-    }
-#endif
-
     unsolResponseIndex = unsolResponse - RIL_UNSOL_RESPONSE_BASE;
 
-    if ((unsolResponse < RIL_UNSOL_RESPONSE_BASE)
-        || (unsolResponse > RIL_UNSOL_RESPONSE_LAST
-                && unsolResponse < RIL_UNSOL_RESPONSE_RADIO_CONFIG_BASE)
-        || (unsolResponse > RIL_UNSOL_RESPONSE_RADIO_CONFIG_LAST)) {
+    pRI = s_unsolResponses;
+    pRI_elements = (int32_t)NUM_ELEMS(s_unsolResponses);
+
+    /* Hack to include Samsung responses */
+    if (unsolResponse >= SAMSUNG_UNSOL_RESPONSE_BASE) {
+        pRI = s_unsolResponses_v;
+        pRI_elements = (int32_t)NUM_ELEMS(s_unsolResponses_v);
+
+        /*
+         * Some of the vendor response codes cannot be found by calculating their index anymore,
+         * because they have an even higher offset and are not ordered in the array.
+         * Example: RIL_UNSOL_SNDMGR_WB_AMR_REPORT = 20017, but it's at index 33 in the vendor
+         * response array.
+         * Thus, look through all the vendor URIs (Unsol Response Info) and pick the correct index.
+         * This has a cost of O(N).
+         */
+        int pRI_index;
+        for (pRI_index = 0; pRI_index < pRI_elements; pRI_index++) {
+            if (pRI[pRI_index].requestNumber == unsolResponse) {
+                unsolResponseIndex = pRI_index;
+            }
+        }
+
+        RLOGD("SAMSUNG: unsolResponse=%d, unsolResponseIndex=%d", unsolResponse, unsolResponseIndex);
+    }
+
+    if (unsolResponseIndex >= 0 && unsolResponseIndex < pRI_elements) {
+        pRI = &pRI[unsolResponseIndex];
+    } else {
+        RLOGE("could not map unsolResponse=%d to %s response array (index=%d)", unsolResponse,
+                pRI == s_unsolResponses ? "AOSP" : "Samsung", unsolResponseIndex);
+    }
+
+    if (pRI == NULL || pRI->responseFunction == NULL) {
         RLOGE("unsupported unsolicited response code %d", unsolResponse);
         return;
     }
 
-    if (unsolResponse >= RIL_UNSOL_RESPONSE_BASE
-            && unsolResponse <= RIL_UNSOL_RESPONSE_LAST) {
-        unsolResponseIndex = unsolResponse - RIL_UNSOL_RESPONSE_BASE;
-        pURI = &(s_unsolResponses[unsolResponseIndex]);
-    } else if (unsolResponse >= RIL_UNSOL_RESPONSE_RADIO_CONFIG_BASE
-            && unsolResponse <= RIL_UNSOL_RESPONSE_RADIO_CONFIG_LAST) {
-        unsolResponseIndex = unsolResponse - RIL_UNSOL_RESPONSE_RADIO_CONFIG_BASE;
-        pURI = &(s_configUnsolResponses[unsolResponseIndex]);
-    }
-
-    // Grab a wake lock if needed for this response,
+    // Grab a wake lock if needed for this reponse,
     // as we exit we'll either release it immediately
     // or set a timer to release it later.
-    switch (s_unsolResponses[unsolResponseIndex].wakeType) {
+    switch (pRI->wakeType) {
         case WAKE_PARTIAL:
             grabPartialWakeLock();
             shouldScheduleTimeout = true;
@@ -827,7 +844,7 @@ void RIL_onUnsolicitedResponse(int unsolResponse, const void *data,
 
         case DONT_WAKE:
         default:
-            // No wake lock is grabbed so don't set timeout
+            // No wake lock is grabed so don't set timeout
             shouldScheduleTimeout = false;
             break;
     }
@@ -836,31 +853,28 @@ void RIL_onUnsolicitedResponse(int unsolResponse, const void *data,
 
     int responseType;
     if (s_callbacks.version >= 13
-                && s_unsolResponses[unsolResponseIndex].wakeType == WAKE_PARTIAL) {
+                && pRI->wakeType == WAKE_PARTIAL) {
         responseType = RESPONSE_UNSOLICITED_ACK_EXP;
     } else {
         responseType = RESPONSE_UNSOLICITED;
     }
 
-    pthread_rwlock_t *radioServiceRwlockPtr = radio_1_6::getRadioServiceRwlock((int) soc_id);
+    pthread_rwlock_t *radioServiceRwlockPtr = radio::getRadioServiceRwlock((int) soc_id);
     int rwlockRet;
 
     if (unsolResponse == RIL_UNSOL_NITZ_TIME_RECEIVED) {
         // get a write lock in caes of NITZ since setNitzTimeReceived() is called
         rwlockRet = pthread_rwlock_wrlock(radioServiceRwlockPtr);
         assert(rwlockRet == 0);
-        radio_1_6::setNitzTimeReceived((int) soc_id, android::elapsedRealtime());
+        radio::setNitzTimeReceived((int) soc_id, android::elapsedRealtime());
     } else {
         rwlockRet = pthread_rwlock_rdlock(radioServiceRwlockPtr);
         assert(rwlockRet == 0);
     }
 
-    if (pURI != NULL && pURI->responseFunction != NULL) {
-        ret = pURI->responseFunction((int) soc_id, responseType, 0, RIL_E_SUCCESS,
-                const_cast<void*>(data), datalen);
-    } else {
-        RLOGW("No call responseFunction defined for UNSOLICITED");
-    }
+    ret = pRI->responseFunction(
+            (int) soc_id, responseType, 0, RIL_E_SUCCESS, const_cast<void*>(data),
+            datalen);
 
     rwlockRet = pthread_rwlock_unlock(radioServiceRwlockPtr);
     assert(rwlockRet == 0);
@@ -1077,17 +1091,17 @@ callStateToString(RIL_CallState s) {
 
 const char *
 requestToString(int request) {
-    /*
-     cat guest/hals/ril/reference-libril/ril_commands.h \
-     | grep -E "^ *{RIL_" \
-     | sed -re 's/\{RIL_([^,]+),[^,]+,([^}]+).+/case RIL_\1: return "\1";/'
+/*
+ cat libs/telephony/ril_commands.h \
+ | egrep "^ *{RIL_" \
+ | sed -re 's/\{RIL_([^,]+),[^,]+,([^}]+).+/case RIL_\1: return "\1";/'
 
 
-     cat guest/hals/ril/reference-libril/ril_unsol_commands.h \
-     | grep -E "^ *{RIL_" \
-     | sed -re 's/\{RIL_([^,]+),([^}]+).+/case RIL_\1: return "\1";/'
+ cat libs/telephony/ril_unsol_commands.h \
+ | egrep "^ *{RIL_" \
+ | sed -re 's/\{RIL_([^,]+),([^}]+).+/case RIL_\1: return "\1";/'
 
-    */
+*/
     switch(request) {
         case RIL_REQUEST_GET_SIM_STATUS: return "GET_SIM_STATUS";
         case RIL_REQUEST_ENTER_SIM_PIN: return "ENTER_SIM_PIN";
@@ -1134,9 +1148,6 @@ requestToString(int request) {
         case RIL_REQUEST_SET_FACILITY_LOCK: return "SET_FACILITY_LOCK";
         case RIL_REQUEST_CHANGE_BARRING_PASSWORD: return "CHANGE_BARRING_PASSWORD";
         case RIL_REQUEST_QUERY_NETWORK_SELECTION_MODE: return "QUERY_NETWORK_SELECTION_MODE";
-        case RIL_REQUEST_SET_SYSTEM_SELECTION_CHANNELS: return "RIL_REQUEST_SET_SYSTEM_SELECTION_CHANNELS";
-        case RIL_REQUEST_GET_SYSTEM_SELECTION_CHANNELS: return "RIL_REQUEST_GET_SYSTEM_SELECTION_CHANNELS";
-        case RIL_REQUEST_START_NETWORK_SCAN: return "RIL_REQUEST_START_NETWORK_SCAN";
         case RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC: return "SET_NETWORK_SELECTION_AUTOMATIC";
         case RIL_REQUEST_SET_NETWORK_SELECTION_MANUAL: return "SET_NETWORK_SELECTION_MANUAL";
         case RIL_REQUEST_QUERY_AVAILABLE_NETWORKS: return "QUERY_AVAILABLE_NETWORKS";
@@ -1230,18 +1241,6 @@ requestToString(int request) {
         case RIL_REQUEST_SET_CARRIER_RESTRICTIONS: return "SET_CARRIER_RESTRICTIONS";
         case RIL_REQUEST_GET_CARRIER_RESTRICTIONS: return "GET_CARRIER_RESTRICTIONS";
         case RIL_REQUEST_SET_CARRIER_INFO_IMSI_ENCRYPTION: return "SET_CARRIER_INFO_IMSI_ENCRYPTION";
-        case RIL_REQUEST_SET_SIGNAL_STRENGTH_REPORTING_CRITERIA: return "SET_SIGNAL_STRENGTH_REPORTING_CRITERIA";
-        case RIL_REQUEST_SET_LINK_CAPACITY_REPORTING_CRITERIA: return "SET_LINK_CAPACITY_REPORTING_CRITERIA";
-        case RIL_REQUEST_ENABLE_UICC_APPLICATIONS: return "ENABLE_UICC_APPLICATIONS";
-        case RIL_REQUEST_ARE_UICC_APPLICATIONS_ENABLED: return "ARE_UICC_APPLICATIONS_ENABLED";
-        case RIL_REQUEST_ENTER_SIM_DEPERSONALIZATION: return "ENTER_SIM_DEPERSONALIZATION";
-        case RIL_REQUEST_CDMA_SEND_SMS_EXPECT_MORE: return "CDMA_SEND_SMS_EXPECT_MORE";
-        case RIL_REQUEST_GET_BARRING_INFO: return "GET_BARRING_INFO";
-        case RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE_BITMAP: return "SET_PREFERRED_NETWORK_TYPE_BITMAP";
-        case RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE_BITMAP: return "GET_PREFERRED_NETWORK_TYPE_BITMAP";
-        case RIL_REQUEST_SET_ALLOWED_NETWORK_TYPES_BITMAP: return "SET_ALLOWED_NETWORK_TYPES_BITMAP";
-        case RIL_REQUEST_GET_ALLOWED_NETWORK_TYPES_BITMAP: return "GET_ALLOWED_NETWORK_TYPES_BITMAP";
-        case RIL_REQUEST_GET_SLICING_CONFIG: return "GET_SLICING_CONFIG";
         case RIL_RESPONSE_ACKNOWLEDGEMENT: return "RESPONSE_ACKNOWLEDGEMENT";
         case RIL_UNSOL_RESPONSE_RADIO_STATE_CHANGED: return "UNSOL_RESPONSE_RADIO_STATE_CHANGED";
         case RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED: return "UNSOL_RESPONSE_CALL_STATE_CHANGED";
@@ -1319,12 +1318,9 @@ rilSocketIdToString(RIL_SOCKET_ID socket_id)
     }
 }
 
-extern "C" void initWithMmapSize() {
-    // Preserve the symbol exported by Samsung's older libril_samsung so rild
-    // trees that still call it continue to link. The AIDL radio path itself
-    // does not depend on hwbinder registration.
-    android::hardware::ProcessState::initWithMmapSize(
-            static_cast<size_t>(HW_BINDER_MMAP_SIZE));
+extern "C" void
+initWithMmapSize() {
+    android::hardware::ProcessState::initWithMmapSize((size_t)(HW_BINDER_MMAP_SIZE));
 }
 
 } /* namespace android */
